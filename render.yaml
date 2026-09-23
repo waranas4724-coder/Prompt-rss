@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ai-trending-prompt
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBSITE_URL
+        sync: false
+      - key: POLL_MINUTES
+        value: "30"
+      - key: POSTS_PER_CYCLE
+        value: "5"
