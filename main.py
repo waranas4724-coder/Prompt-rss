@@ -6,9 +6,11 @@ import sqlite3
 import threading
 import logging
 import asyncio
+import tempfile
+import mimetypes
+from urllib.parse import urlparse, urljoin
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
 from pathlib import Path
 
 import feedparser
@@ -16,6 +18,11 @@ import requests
 from flask import Flask, jsonify, request, send_from_directory
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 # ============================================================
 # CONFIG
@@ -216,6 +223,7 @@ def init_db():
         tutorial TEXT,
         media_type TEXT NOT NULL DEFAULT 'image',
         image TEXT,
+        video TEXT,
         source TEXT,
         source_url TEXT,
         model TEXT,
@@ -243,6 +251,19 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_prompts_type
     ON prompts(media_type);
     """)
+
+    # Migrate older databases that were created without video support.
+    columns = {
+        row[1]
+        for row in con.execute(
+            "PRAGMA table_info(prompts)"
+        ).fetchall()
+    }
+
+    if "video" not in columns:
+        con.execute(
+            "ALTER TABLE prompts ADD COLUMN video TEXT DEFAULT ''"
+        )
 
     for name, url in RSS_FEEDS:
         con.execute(
@@ -387,41 +408,281 @@ MODEL_RE = re.compile(
 )
 
 
-def extract_image(entry):
-    for key in ("media_content", "media_thumbnail"):
-        vals = entry.get(key) or []
+def _absolute_url(base_url, value):
+    """Convert relative media URLs into absolute HTTP(S) URLs."""
+    if not value:
+        return ""
 
-        if vals:
-            url = vals[0].get("url")
+    value = html.unescape(str(value).strip())
 
-            if url:
-                return url.strip()
+    if value.startswith("//"):
+        return "https:" + value
 
-    for enclosure in entry.get("enclosures", []) or []:
-        url = enclosure.get("href") or enclosure.get("url")
+    return urljoin(base_url or "", value)
 
-        if url and re.search(
-            r"\.(jpg|jpeg|png|webp|gif)(\?.*)?$",
+
+def _is_image_url(url):
+    return bool(
+        url and re.search(
+            r"\.(?:jpg|jpeg|png|webp|gif|avif)(?:\?.*)?$",
             url,
             re.I
+        )
+    )
+
+
+def _is_video_url(url):
+    return bool(
+        url and re.search(
+            r"\.(?:mp4|webm|mov|m4v|m3u8)(?:\?.*)?$",
+            url,
+            re.I
+        )
+    )
+
+
+def extract_image(entry, base_url=""):
+    """
+    Extract the best image URL available directly from an RSS/Atom entry.
+    """
+    # RSS media namespace
+    for key in (
+        "media_content",
+        "media_thumbnail",
+        "media:content",
+        "media:thumbnail",
+    ):
+        vals = entry.get(key) or []
+
+        if isinstance(vals, dict):
+            vals = [vals]
+
+        for value in vals:
+            url = (
+                value.get("url")
+                or value.get("href")
+                or value.get("src")
+            )
+
+            url = _absolute_url(base_url, url)
+
+            if url and (
+                _is_image_url(url)
+                or str(value.get("type", "")).startswith("image/")
+            ):
+                return url
+
+    # RSS enclosure
+    for enclosure in entry.get("enclosures", []) or []:
+        url = (
+            enclosure.get("href")
+            or enclosure.get("url")
+        )
+
+        url = _absolute_url(base_url, url)
+
+        if url and (
+            _is_image_url(url)
+            or str(enclosure.get("type", "")).startswith("image/")
         ):
-            return url.strip()
+            return url
 
-    html_block = (
-        entry.get("summary", "")
-        or entry.get("description", "")
-    )
+    # HTML inside summary/description/content
+    blocks = []
 
-    match = re.search(
+    for key in ("summary", "description"):
+        value = entry.get(key)
+        if value:
+            blocks.append(str(value))
+
+    for content in entry.get("content", []) or []:
+        if isinstance(content, dict):
+            value = content.get("value")
+            if value:
+                blocks.append(str(value))
+
+    html_block = "\n".join(blocks)
+
+    # Prefer Open Graph / Twitter image if present in entry HTML.
+    patterns = [
+        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
         r'<img[^>]+src=["\']([^"\']+)["\']',
-        html_block,
-        re.I
-    )
+        r'<img[^>]+data-src=["\']([^"\']+)["\']',
+    ]
 
-    return match.group(1).strip() if match else ""
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            html_block,
+            re.I
+        )
+
+        if match:
+            url = _absolute_url(
+                base_url,
+                match.group(1)
+            )
+
+            if url:
+                return url
+
+    return ""
+
+
+def extract_video(entry, base_url=""):
+    """
+    Extract a direct video URL from an RSS/Atom entry when available.
+    """
+    for key in (
+        "media_content",
+        "media:content",
+        "enclosures",
+    ):
+        vals = entry.get(key) or []
+
+        if isinstance(vals, dict):
+            vals = [vals]
+
+        for value in vals:
+            url = (
+                value.get("url")
+                or value.get("href")
+                or value.get("src")
+            )
+
+            url = _absolute_url(base_url, url)
+
+            content_type = str(
+                value.get("type", "")
+            ).lower()
+
+            if url and (
+                _is_video_url(url)
+                or content_type.startswith("video/")
+            ):
+                return url
+
+    blocks = []
+
+    for key in ("summary", "description"):
+        value = entry.get(key)
+        if value:
+            blocks.append(str(value))
+
+    for content in entry.get("content", []) or []:
+        if isinstance(content, dict) and content.get("value"):
+            blocks.append(str(content["value"]))
+
+    html_block = "\n".join(blocks)
+
+    patterns = [
+        r'<video[^>]+src=["\']([^"\']+)["\']',
+        r'<source[^>]+src=["\']([^"\']+)["\']',
+        r'<video[^>]*>.*?<source[^>]+src=["\']([^"\']+)["\']',
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            html_block,
+            re.I | re.S
+        )
+
+        if match:
+            url = _absolute_url(
+                base_url,
+                match.group(1)
+            )
+
+            if url:
+                return url
+
+    return ""
+
+
+def extract_page_media(source_url):
+    """
+    Open the article page only when RSS did not provide media.
+    Returns (image_url, video_url).
+    """
+    if not source_url:
+        return "", ""
+
+    try:
+        response = requests.get(
+            source_url,
+            headers=REQUEST_HEADERS,
+            timeout=10,
+            allow_redirects=True,
+        )
+
+        response.raise_for_status()
+
+        page_url = response.url or source_url
+        body = response.text[:1500000]
+
+        image = ""
+        video = ""
+
+        # OpenGraph / Twitter image.
+        image_patterns = [
+            r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
+            r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+        ]
+
+        for pattern in image_patterns:
+            match = re.search(
+                pattern,
+                body,
+                re.I
+            )
+
+            if match:
+                image = _absolute_url(
+                    page_url,
+                    match.group(1)
+                )
+                if image:
+                    break
+
+        # Direct HTML video/source.
+        video_patterns = [
+            r'<video[^>]+src=["\']([^"\']+)["\']',
+            r'<source[^>]+src=["\']([^"\']+)["\']',
+            r'<video[^>]*>.*?<source[^>]+src=["\']([^"\']+)["\']',
+        ]
+
+        for pattern in video_patterns:
+            match = re.search(
+                pattern,
+                body,
+                re.I | re.S
+            )
+
+            if match:
+                video = _absolute_url(
+                    page_url,
+                    match.group(1)
+                )
+                if video:
+                    break
+
+        return image, video
+
+    except Exception as exc:
+        log.debug(
+            "Page media extraction failed: %s | %s",
+            source_url,
+            exc
+        )
+        return "", ""
 
 
 def infer_model(text):
+
     match = MODEL_RE.search(text)
 
     if match:
@@ -634,14 +895,23 @@ def fetch_feed(row):
             if not title:
                 continue
 
+            desc_parts = [
+                entry.get("summary", ""),
+                entry.get("description", ""),
+            ]
+
+            for content in entry.get("content", []) or []:
+                if isinstance(content, dict):
+                    desc_parts.append(
+                        content.get("value", "")
+                    )
+
             desc = clean_text(
-                entry.get("summary", "")
-                or entry.get("description", "")
-                or entry.get("content", [{}])[0].get(
-                    "value", ""
+                " ".join(
+                    str(x)
+                    for x in desc_parts
+                    if x
                 )
-                if entry.get("content")
-                else ""
             )
 
             source_url = (
@@ -672,7 +942,32 @@ def fetch_feed(row):
                 continue
 
             model = infer_model(combined)
-            image = extract_image(entry)
+
+            # First use media supplied by RSS.
+            image = extract_image(
+                entry,
+                source_url
+            )
+
+            video = extract_video(
+                entry,
+                source_url
+            )
+
+            # If RSS does not expose media, inspect the source
+            # article's OpenGraph/HTML media metadata.
+            if not image or (
+                media == "video" and not video
+            ):
+                page_image, page_video = extract_page_media(
+                    source_url
+                )
+
+                if not image:
+                    image = page_image
+
+                if not video:
+                    video = page_video
 
             uid = uid_for(
                 source_url,
@@ -687,6 +982,7 @@ def fetch_feed(row):
                 "tutorial": "",
                 "media_type": media,
                 "image": image,
+                "video": video,
                 "source": row["name"],
                 "source_url": source_url,
                 "model": model,
@@ -758,6 +1054,7 @@ def collect():
                     tutorial,
                     media_type,
                     image,
+                    video,
                     source,
                     source_url,
                     model,
@@ -779,6 +1076,7 @@ def collect():
                     item["tutorial"],
                     item["media_type"],
                     item["image"],
+                    item.get("video", ""),
                     item["source"],
                     item["source_url"],
                     item["model"],
@@ -816,15 +1114,25 @@ def collect():
 # ============================================================
 
 def design_caption(item, n):
+    """
+    Professional media-first Telegram caption.
+    The channel post is a teaser; the full prompt lives
+    behind the website button.
+    """
+
     title = html.escape(
         str(item.get("title", ""))[:220]
     )
 
-    media = (
-        "🎬 VIDEO"
-        if item.get("media_type") == "video"
-        else "🖼️ IMAGE"
+    media_type = item.get(
+        "media_type",
+        "image"
     )
+
+    if media_type == "video":
+        media = "🎬 <b>AI VIDEO</b>"
+    else:
+        media = "🖼️ <b>AI IMAGE</b>"
 
     model = html.escape(
         str(item.get("model", "Other"))[:80]
@@ -834,94 +1142,83 @@ def design_caption(item, n):
         str(item.get("source", "Unknown"))[:100]
     )
 
-    tags = html.escape(
-        str(
-            item.get("tags")
-            or "AI • Creative • Trending"
-        )[:180]
+    tags_raw = (
+        item.get("tags")
+        or "AI • Creative • Trending"
     )
 
-    # Telegram photo captions have a 1024-character limit.
-    # Keep prompt short enough so HTML tags remain valid.
+    tags = html.escape(
+        str(tags_raw)[:180]
+    )
+
     prompt = clean_text(
         str(item.get("prompt", ""))
     )
 
-    short = prompt[:430]
+    # Small preview only. Full prompt is on website.
+    preview = prompt[:260]
+
+    if media_type == "video":
+        icon = "🎬"
+    else:
+        icon = "✨"
 
     templates = [
         (
-            f"🔥 <b>TRENDING AI PROMPT #{n}</b>\n\n"
-            f"{media} • {title}\n\n"
-            f"🤖 Model: {model}\n"
-            f"🏷️ {tags}\n\n"
-            f"✨ <b>Prompt</b>\n"
-            f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"📡 Source: {source}"
-        ),
-
-        (
-            f"╭─ ✦ <b>DAILY AI DROP</b>\n"
-            f"│ {media}\n"
-            f"╰─ {title}\n\n"
-            f"🧠 <b>MODEL</b> {model}\n\n"
-            f"📝 <b>PROMPT</b>\n"
-            f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"🔎 {source}"
-        ),
-
-        (
-            f"🚀 <b>NEW CREATIVE FIND</b>\n\n"
-            f"{title}\n\n"
-            f"{media} | {model}\n\n"
-            f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"#AI #Prompt "
-            f"#{'Video' if item.get('media_type') == 'video' else 'Image'}"
-        ),
-
-        (
-            f"💎 <b>PROMPT OF THE DAY</b>\n\n"
-            f"🎯 {title}\n"
-            f"🧩 {model}\n"
-            f"📂 {tags}\n\n"
-            f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"⚡ Save it. Copy it. Create."
-        ),
-
-        (
-            f"🪄 <b>AI CREATOR CARD</b>\n\n"
+            f"🔥 <b>AI CREATIVE DROP #{n}</b>\n\n"
             f"{media}\n"
             f"<b>{title}</b>\n\n"
-            f"Prompt ↓\n"
-            f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"🧠 {model} • {source}"
+            f"🤖 <b>Model:</b> {model}\n"
+            f"🏷️ <b>Tags:</b> {tags}\n\n"
+            f"{icon} <b>Prompt Preview</b>\n"
+            f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+            f"📡 <b>Source:</b> {source}\n\n"
+            f"👇 <b>Get the full prompt below</b>"
+        ),
+        (
+            f"╭━━━ ✦ <b>AI CREATOR FIND</b>\n"
+            f"┃ {media}\n"
+            f"┃ <b>{title}</b>\n"
+            f"╰━━━━━━━━━━━━\n\n"
+            f"🧠 <b>{model}</b>\n"
+            f"🏷️ {tags}\n\n"
+            f"📝 <b>Prompt Preview</b>\n"
+            f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+            f"📋 Full prompt • source • details ↓"
+        ),
+        (
+            f"🚀 <b>NEW AI INSPIRATION</b>\n\n"
+            f"{media}\n"
+            f"<b>{title}</b>\n\n"
+            f"🎯 <b>Model:</b> {model}\n"
+            f"📝 <b>Preview:</b>\n"
+            f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+            f"✨ Explore • Copy • Create"
+        ),
+        (
+            f"💎 <b>CREATOR CARD #{n}</b>\n\n"
+            f"{media}\n"
+            f"<b>{title}</b>\n\n"
+            f"🤖 {model}\n"
+            f"🏷️ {tags}\n\n"
+            f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+            f"🌐 Full prompt & source below"
+        ),
+        (
+            f"🪄 <b>FRESH AI DISCOVERY</b>\n\n"
+            f"{media}\n"
+            f"<b>{title}</b>\n\n"
+            f"🧩 <b>{model}</b> • {source}\n\n"
+            f"📝 <b>Prompt Preview</b>\n"
+            f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+            f"⚡ Copy the complete prompt below"
         ),
     ]
 
-    base = templates[
+    result = templates[
         (n - 1) % len(templates)
     ]
 
-    suffixes = [
-        "👇 Open the full prompt below.",
-        "📌 Full prompt available on the website.",
-        "🔥 Trending today.",
-        "🎨 Built for creators.",
-        "⚡ Try this idea with your favorite AI model.",
-        "📋 Copy-ready prompt.",
-        "🌐 More details inside.",
-        "✨ Fresh AI inspiration.",
-        "🎬 Explore • Copy • Create.",
-        "💡 Keep this one saved.",
-    ]
-
-    suffix = suffixes[
-        ((n - 1) // 5) % len(suffixes)
-    ]
-
-    result = base + "\n\n" + suffix
-
-    # Safety limit for Telegram photo captions.
     if len(result) > 1000:
         result = result[:997] + "..."
 
@@ -1020,19 +1317,113 @@ def design_keyboard(item):
     )
 
 
+def _download_video_sync(url, item_id):
+    """
+    Download a source video using yt-dlp into /tmp.
+    Maximum target quality: 720p.
+    Returns local file path or empty string.
+    """
+    if not url:
+        return ""
+
+    if yt_dlp is None:
+        log.warning(
+            "yt-dlp is not installed; video cannot be downloaded."
+        )
+        return ""
+
+    temp_dir = tempfile.mkdtemp(
+        prefix=f"ai_prompt_{item_id}_"
+    )
+
+    output_template = os.path.join(
+        temp_dir,
+        "video.%(ext)s"
+    )
+
+    options = {
+        "outtmpl": output_template,
+        # Prefer a single-file MP4 so Render does not require
+        # a separate ffmpeg merge step.
+        "format": (
+            "b[ext=mp4][height<=720]/"
+            "b[height<=720]/"
+            "best"
+        ),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 15,
+        "max_filesize": 49 * 1024 * 1024,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+
+        candidates = []
+
+        for name in os.listdir(temp_dir):
+            path = os.path.join(
+                temp_dir,
+                name
+            )
+
+            if os.path.isfile(path):
+                candidates.append(path)
+
+        if not candidates:
+            return ""
+
+        # Prefer MP4.
+        mp4 = [
+            p for p in candidates
+            if p.lower().endswith(".mp4")
+        ]
+
+        return mp4[0] if mp4 else candidates[0]
+
+    except Exception as exc:
+        log.warning(
+            "Video download failed for item #%s: %s",
+            item_id,
+            exc
+        )
+
+        # Cleanup on failed download.
+        try:
+            for name in os.listdir(temp_dir):
+                os.remove(
+                    os.path.join(temp_dir, name)
+                )
+            os.rmdir(temp_dir)
+        except Exception:
+            pass
+
+        return ""
+
+
 async def publish_item(bot, item):
     """
-    Publish one item.
-    If an image cannot be sent, automatically fall back
-    to a text post so the queue does not get stuck.
+    Publish a professional media-first Telegram post.
+
+    Priority:
+      1. Video
+      2. Photo
+      3. Text fallback
+
+    Local downloaded media is deleted after Telegram accepts it.
     """
 
     item = dict(item)
-
     item_id = item.get("id", "?")
 
     try:
-        n = ((int(item_id) - 1) % 50) + 1
+        n = (
+            (int(item_id) - 1) % 50
+        ) + 1
     except (TypeError, ValueError):
         n = 1
 
@@ -1052,7 +1443,98 @@ async def publish_item(bot, item):
     )
 
     # --------------------------------------------------------
-    # PHOTO FIRST
+    # 1. VIDEO
+    # --------------------------------------------------------
+
+    video_url = safe_url(
+        item.get("video", "")
+    )
+
+    # If RSS/page did not give a direct video URL, try the
+    # source page itself with yt-dlp. This supports many
+    # video platforms embedded in articles.
+    if (
+        item.get("media_type") == "video"
+        and not video_url
+    ):
+        video_url = safe_url(
+            item.get("source_url", "")
+        )
+
+    if (
+        item.get("media_type") == "video"
+        and video_url
+    ):
+        local_video = ""
+
+        try:
+            local_video = await asyncio.to_thread(
+                _download_video_sync,
+                video_url,
+                item_id
+            )
+
+            if local_video and os.path.exists(local_video):
+
+                kwargs = {
+                    "chat_id": TG_CHAT_ID,
+                    "video": local_video,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                }
+
+                if markup:
+                    kwargs["reply_markup"] = markup
+
+                try:
+                    await bot.send_video(
+                        **kwargs
+                    )
+
+                    log.info(
+                        "Published VIDEO item #%s",
+                        item_id
+                    )
+
+                    return True
+
+                except Exception as exc:
+                    log.warning(
+                        "Telegram video send failed #%s: %s",
+                        item_id,
+                        exc
+                    )
+
+        finally:
+            # Always delete downloaded video.
+            if local_video:
+                try:
+                    temp_dir = os.path.dirname(
+                        local_video
+                    )
+
+                    if os.path.exists(
+                        local_video
+                    ):
+                        os.remove(
+                            local_video
+                        )
+
+                    if os.path.isdir(
+                        temp_dir
+                    ):
+                        os.rmdir(
+                            temp_dir
+                        )
+
+                except Exception as exc:
+                    log.debug(
+                        "Video cleanup failed: %s",
+                        exc
+                    )
+
+    # --------------------------------------------------------
+    # 2. PHOTO
     # --------------------------------------------------------
 
     image_url = safe_url(
@@ -1071,10 +1553,12 @@ async def publish_item(bot, item):
             if markup:
                 kwargs["reply_markup"] = markup
 
-            await bot.send_photo(**kwargs)
+            await bot.send_photo(
+                **kwargs
+            )
 
             log.info(
-                "Published photo item #%s",
+                "Published PHOTO item #%s",
                 item_id
             )
 
@@ -1082,14 +1566,13 @@ async def publish_item(bot, item):
 
         except Exception as exc:
             log.warning(
-                "Photo failed for item #%s; "
-                "using text fallback: %s",
+                "Telegram photo send failed #%s: %s",
                 item_id,
                 exc
             )
 
     # --------------------------------------------------------
-    # TEXT FALLBACK
+    # 3. TEXT FALLBACK
     # --------------------------------------------------------
 
     try:
@@ -1102,10 +1585,12 @@ async def publish_item(bot, item):
         if markup:
             kwargs["reply_markup"] = markup
 
-        await bot.send_message(**kwargs)
+        await bot.send_message(
+            **kwargs
+        )
 
         log.info(
-            "Published text item #%s",
+            "Published TEXT fallback item #%s",
             item_id
         )
 
@@ -1113,7 +1598,7 @@ async def publish_item(bot, item):
 
     except Exception as exc:
         log.error(
-            "Telegram publish failed for item #%s: %s",
+            "Telegram publish failed #%s: %s",
             item_id,
             exc
         )
