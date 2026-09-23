@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import html
 import hashlib
 import sqlite3
@@ -32,31 +31,26 @@ ADMIN_IDS = {
 }
 
 PORT = int(os.environ.get("PORT", "10000"))
-
-DB_FILE = os.environ.get(
-    "DB_FILE",
-    "/tmp/ai_prompt.db"
-)
+DB_FILE = os.environ.get("DB_FILE", "/tmp/ai_prompt.db")
 
 WEBSITE_URL = os.environ.get(
     "WEBSITE_URL",
     "https://your-site.netlify.app"
-).rstrip("/")
+).strip().rstrip("/")
 
-POLL_MINUTES = int(
-    os.environ.get("POLL_MINUTES", "30")
-)
-
-POSTS_PER_CYCLE = int(
-    os.environ.get("POSTS_PER_CYCLE", "5")
-)
+POLL_MINUTES = max(1, int(os.environ.get("POLL_MINUTES", "30")))
+POSTS_PER_CYCLE = max(1, int(os.environ.get("POSTS_PER_CYCLE", "5")))
 
 REQUEST_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 "
-        "AI-Prompt-Aggregator/1.0 "
-        "(+RSS reader)"
-    )
+        "Mozilla/5.0 (Linux; Android 10) "
+        "AppleWebKit/537.36 Chrome/120 Safari/537.36 "
+        "AI-Prompt-Aggregator/2.0"
+    ),
+    "Accept": (
+        "application/rss+xml, application/atom+xml, "
+        "application/xml, text/xml, text/html;q=0.9, */*;q=0.8"
+    ),
 }
 
 HTTP_TIMEOUT = 18
@@ -67,14 +61,13 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("ai-prompt")
-
 app = Flask(__name__)
 
 AUTOMATION_STOPPED = False
 
 
 # ============================================================
-# 100 RSS SOURCES
+# RSS SOURCES
 # ============================================================
 
 RSS_FEEDS = [
@@ -203,7 +196,8 @@ def now():
 def db():
     con = sqlite3.connect(
         DB_FILE,
-        check_same_thread=False
+        check_same_thread=False,
+        timeout=30
     )
     con.row_factory = sqlite3.Row
     return con
@@ -267,11 +261,7 @@ def init_db():
 
 
 def uid_for(url, title):
-    raw = (
-        url.strip()
-        + "|"
-        + title.strip().lower()
-    )
+    raw = url.strip() + "|" + title.strip().lower()
 
     return hashlib.sha256(
         raw.encode("utf-8")
@@ -279,12 +269,7 @@ def uid_for(url, title):
 
 
 def clean_text(s):
-    s = re.sub(
-        r"<[^>]+>",
-        " ",
-        s or ""
-    )
-
+    s = re.sub(r"<[^>]+>", " ", s or "")
     s = html.unescape(s)
 
     return re.sub(
@@ -327,7 +312,7 @@ AI_TERMS = {
     "luma",
     "pika",
     "grok imagine",
-    "chatgpt image"
+    "chatgpt image",
 }
 
 IMAGE_TERMS = {
@@ -339,7 +324,10 @@ IMAGE_TERMS = {
     "visual",
     "art",
     "photography",
-    "thumbnail"
+    "thumbnail",
+    "character",
+    "design",
+    "render",
 }
 
 VIDEO_TERMS = {
@@ -357,7 +345,8 @@ VIDEO_TERMS = {
     "runway",
     "seedance",
     "pika",
-    "luma"
+    "luma",
+    "camera",
 }
 
 PROMPT_TERMS = {
@@ -370,7 +359,10 @@ PROMPT_TERMS = {
     "generation",
     "generate",
     "create",
-    "style"
+    "style",
+    "how to",
+    "tutorial",
+    "guide",
 }
 
 MODEL_RE = re.compile(
@@ -391,22 +383,29 @@ MODEL_RE = re.compile(
     r"|Luma"
     r"|Grok Imagine"
     r")\b",
-    re.I
+    re.I,
 )
 
 
 def extract_image(entry):
-    for key in (
-        "media_content",
-        "media_thumbnail"
-    ):
+    for key in ("media_content", "media_thumbnail"):
         vals = entry.get(key) or []
 
         if vals:
             url = vals[0].get("url")
 
             if url:
-                return url
+                return url.strip()
+
+    for enclosure in entry.get("enclosures", []) or []:
+        url = enclosure.get("href") or enclosure.get("url")
+
+        if url and re.search(
+            r"\.(jpg|jpeg|png|webp|gif)(\?.*)?$",
+            url,
+            re.I
+        ):
+            return url.strip()
 
     html_block = (
         entry.get("summary", "")
@@ -419,7 +418,7 @@ def extract_image(entry):
         re.I
     )
 
-    return match.group(1) if match else ""
+    return match.group(1).strip() if match else ""
 
 
 def infer_model(text):
@@ -432,51 +431,48 @@ def infer_model(text):
 
 
 def classify(title, desc):
-    text = (
-        title
-        + " "
-        + desc
-    ).lower()
+    text = (title + " " + desc).lower()
 
     ai_hits = sum(
-        1
-        for x in AI_TERMS
+        1 for x in AI_TERMS
         if x in text
     )
 
     image_hits = sum(
-        1
-        for x in IMAGE_TERMS
+        1 for x in IMAGE_TERMS
         if x in text
     )
 
     video_hits = sum(
-        1
-        for x in VIDEO_TERMS
+        1 for x in VIDEO_TERMS
         if x in text
     )
 
     prompt_hits = sum(
-        1
-        for x in PROMPT_TERMS
+        1 for x in PROMPT_TERMS
         if x in text
     )
 
     if ai_hits < 1:
         return None
 
-    if prompt_hits < 1:
+    # AI content is accepted even when the source article
+    # does not literally contain the word "prompt".
+    # This makes the aggregator useful for prompt extraction.
+    if (
+        prompt_hits < 1
+        and image_hits < 1
+        and video_hits < 1
+    ):
         return None
 
-    if video_hits > image_hits:
-        media = "video"
-    else:
-        media = "image"
+    media = (
+        "video"
+        if video_hits > image_hits
+        else "image"
+    )
 
-    if (
-        "prompt" in text
-        or "prompting" in text
-    ):
+    if "prompt" in text or "prompting" in text:
         category = "Prompt"
     elif media == "video":
         category = "AI Video"
@@ -498,10 +494,13 @@ def extract_prompt(title, desc):
 
     patterns = [
         r"(?:prompt|prompt:|use this prompt|copy this prompt)"
-        r"\s*[:\-]\s*(.{80,1800})",
+        r"\s*[:\-]\s*(.{50,1800})",
 
         r"(?:example prompt)"
-        r"\s*[:\-]\s*(.{80,1800})"
+        r"\s*[:\-]\s*(.{50,1800})",
+
+        r"(?:prompt below|prompt is)"
+        r"\s*[:\-]?\s*(.{50,1800})",
     ]
 
     for pattern in patterns:
@@ -512,30 +511,41 @@ def extract_prompt(title, desc):
         )
 
         if match:
-            return match.group(1).strip()
+            result = match.group(1).strip()
 
-    if len(text) >= 120:
+            if len(result) >= 50:
+                return result
+
+    # If article contains useful descriptive text,
+    # generate a source-based prompt.
+    if len(text) >= 80:
         kind = (
             "video"
-            if "video" in (
-                title + " " + desc
-            ).lower()
+            if any(
+                x in (title + " " + desc).lower()
+                for x in VIDEO_TERMS
+            )
             else "image"
         )
 
         return (
             f"Create an AI {kind} inspired by "
             f"this concept: {title.strip()}. "
-            f"Preserve the key visual direction "
-            f"described by the source."
+            f"Visual direction and subject: {text[:900]}. "
+            f"Make the result detailed, polished and "
+            f"creator-ready."
         )
 
-    return ""
+    return (
+        f"Create a high-quality AI image inspired by: "
+        f"{title.strip()}"
+        if title.strip()
+        else ""
+    )
 
 
 def tags_for(text):
     tags = []
-
     low = text.lower()
 
     tag_words = [
@@ -552,7 +562,10 @@ def tags_for(text):
         "realistic",
         "film",
         "social media",
-        "poster"
+        "poster",
+        "character",
+        "architecture",
+        "landscape",
     ]
 
     for word in tag_words:
@@ -588,7 +601,8 @@ def fetch_feed(row):
         response = requests.get(
             row["url"],
             headers=REQUEST_HEADERS,
-            timeout=HTTP_TIMEOUT
+            timeout=HTTP_TIMEOUT,
+            allow_redirects=True,
         )
 
         response.raise_for_status()
@@ -597,10 +611,22 @@ def fetch_feed(row):
             response.content
         )
 
+        if getattr(parsed, "bozo", False):
+            log.warning(
+                "Malformed RSS feed: %s",
+                row["name"]
+            )
+
+        if not parsed.entries:
+            log.warning(
+                "No RSS entries: %s",
+                row["name"]
+            )
+            return []
+
         out = []
 
         for entry in parsed.entries[:30]:
-
             title = clean_text(
                 entry.get("title", "")
             )
@@ -611,17 +637,20 @@ def fetch_feed(row):
             desc = clean_text(
                 entry.get("summary", "")
                 or entry.get("description", "")
+                or entry.get("content", [{}])[0].get(
+                    "value", ""
+                )
+                if entry.get("content")
+                else ""
             )
 
             source_url = (
                 entry.get("link", "")
                 or row["url"]
-            )
+            ).strip()
 
             combined = (
-                title
-                + " "
-                + desc
+                title + " " + desc
             )
 
             classification = classify(
@@ -642,13 +671,8 @@ def fetch_feed(row):
             if not prompt:
                 continue
 
-            model = infer_model(
-                combined
-            )
-
-            image = extract_image(
-                entry
-            )
+            model = infer_model(combined)
+            image = extract_image(entry)
 
             uid = uid_for(
                 source_url,
@@ -668,7 +692,7 @@ def fetch_feed(row):
                 "model": model,
                 "category": category,
                 "tags": tags_for(combined),
-                "score": score
+                "score": score,
             })
 
         return out
@@ -679,17 +703,19 @@ def fetch_feed(row):
             row["name"],
             exc
         )
-
         return []
 
 
 def collect():
     feeds = get_feeds()
-
     items = []
 
+    if not feeds:
+        log.warning("No active RSS feeds.")
+        return []
+
     with ThreadPoolExecutor(
-        max_workers=12
+        max_workers=min(12, max(1, len(feeds)))
     ) as executor:
 
         futures = [
@@ -700,9 +726,7 @@ def collect():
             for row in feeds
         ]
 
-        for future in as_completed(
-            futures
-        ):
+        for future in as_completed(futures):
             try:
                 items.extend(
                     future.result()
@@ -714,11 +738,9 @@ def collect():
                 )
 
     con = db()
-
     new_items = []
 
     for item in items:
-
         item["score"] = round(
             float(item["score"]) + 10,
             2
@@ -763,16 +785,20 @@ def collect():
                     item["category"],
                     item["tags"],
                     item["score"],
-                    now()
+                    now(),
                 )
             )
 
             item["id"] = cursor.lastrowid
-
             new_items.append(item)
 
         except sqlite3.IntegrityError:
             pass
+        except Exception as exc:
+            log.warning(
+                "Database insert failed: %s",
+                exc
+            )
 
     con.commit()
     con.close()
@@ -786,52 +812,62 @@ def collect():
 
 
 # ============================================================
-# 50 TELEGRAM DESIGNS
+# TELEGRAM DESIGNS
 # ============================================================
 
 def design_caption(item, n):
-
-    title = item["title"]
+    title = html.escape(
+        str(item.get("title", ""))[:220]
+    )
 
     media = (
         "🎬 VIDEO"
-        if item["media_type"] == "video"
+        if item.get("media_type") == "video"
         else "🖼️ IMAGE"
     )
 
-    model = item["model"]
-
-    source = item["source"]
-
-    tags = (
-        item["tags"]
-        or "AI • Creative • Trending"
+    model = html.escape(
+        str(item.get("model", "Other"))[:80]
     )
 
-    prompt = item["prompt"]
+    source = html.escape(
+        str(item.get("source", "Unknown"))[:100]
+    )
 
-    short = prompt[:900]
+    tags = html.escape(
+        str(
+            item.get("tags")
+            or "AI • Creative • Trending"
+        )[:180]
+    )
+
+    # Telegram photo captions have a 1024-character limit.
+    # Keep prompt short enough so HTML tags remain valid.
+    prompt = clean_text(
+        str(item.get("prompt", ""))
+    )
+
+    short = prompt[:430]
 
     templates = [
-
         (
-            f"🔥 TRENDING AI PROMPT #{n}\n\n"
-            f"{media}  •  {title}\n\n"
+            f"🔥 <b>TRENDING AI PROMPT #{n}</b>\n\n"
+            f"{media} • {title}\n\n"
             f"🤖 Model: {model}\n"
             f"🏷️ {tags}\n\n"
-            f"✨ Prompt\n"
+            f"✨ <b>Prompt</b>\n"
             f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"📡 Source: {html.escape(source)}"
+            f"📡 Source: {source}"
         ),
 
         (
-            f"╭─ ✦ DAILY AI DROP\n"
+            f"╭─ ✦ <b>DAILY AI DROP</b>\n"
             f"│ {media}\n"
             f"╰─ {title}\n\n"
-            f"🧠 <b>MODEL</b>  {model}\n\n"
+            f"🧠 <b>MODEL</b> {model}\n\n"
             f"📝 <b>PROMPT</b>\n"
             f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"🔎 {html.escape(source)}"
+            f"🔎 {source}"
         ),
 
         (
@@ -840,7 +876,7 @@ def design_caption(item, n):
             f"{media} | {model}\n\n"
             f"<blockquote>{html.escape(short)}</blockquote>\n\n"
             f"#AI #Prompt "
-            f"#{'Video' if item['media_type'] == 'video' else 'Image'}"
+            f"#{'Video' if item.get('media_type') == 'video' else 'Image'}"
         ),
 
         (
@@ -858,102 +894,227 @@ def design_caption(item, n):
             f"<b>{title}</b>\n\n"
             f"Prompt ↓\n"
             f"<blockquote>{html.escape(short)}</blockquote>\n\n"
-            f"🧠 {model} • {html.escape(source)}"
-        )
+            f"🧠 {model} • {source}"
+        ),
     ]
 
     base = templates[
-        (n - 1) % 5
+        (n - 1) % len(templates)
     ]
 
     suffixes = [
-        "\n\n👇 Open the full prompt below.",
-        "\n\n📌 Full prompt available on the website.",
-        "\n\n🔥 Trending today.",
-        "\n\n🎨 Built for creators.",
-        "\n\n⚡ Try this idea with your favorite AI model.",
-        "\n\n📋 Copy-ready prompt.",
-        "\n\n🌐 More details inside.",
-        "\n\n✨ Fresh AI inspiration.",
-        "\n\n🎬 Explore • Copy • Create.",
-        "\n\n💡 Keep this one saved."
+        "👇 Open the full prompt below.",
+        "📌 Full prompt available on the website.",
+        "🔥 Trending today.",
+        "🎨 Built for creators.",
+        "⚡ Try this idea with your favorite AI model.",
+        "📋 Copy-ready prompt.",
+        "🌐 More details inside.",
+        "✨ Fresh AI inspiration.",
+        "🎬 Explore • Copy • Create.",
+        "💡 Keep this one saved.",
     ]
 
-    suffix_index = (
-        (n - 1) // 5
-    ) % len(suffixes)
-
-    return base + suffixes[
-        suffix_index
+    suffix = suffixes[
+        ((n - 1) // 5) % len(suffixes)
     ]
+
+    result = base + "\n\n" + suffix
+
+    # Safety limit for Telegram photo captions.
+    if len(result) > 1000:
+        result = result[:997] + "..."
+
+    return result
+
+
+# ============================================================
+# FIXED INLINE KEYBOARD
+# ============================================================
+
+def safe_url(url):
+    """
+    Telegram inline URL buttons must contain a real
+    HTTP/HTTPS URL.
+    """
+    if not url:
+        return ""
+
+    value = str(url).strip()
+
+    if value.startswith("https://") or value.startswith("http://"):
+        return value
+
+    return ""
 
 
 def design_keyboard(item):
+    """
+    IMPORTANT:
+    Only InlineKeyboardButton is used here.
+    KeyboardButton must NEVER be used inside
+    InlineKeyboardMarkup.
+    """
 
-    article_url = (
-        f"{WEBSITE_URL}/?id={item['id']}"
+    buttons = []
+
+    try:
+        item_id = int(item.get("id", 0))
+    except (TypeError, ValueError):
+        item_id = 0
+
+    # --------------------------------------------------------
+    # FULL PROMPT
+    # --------------------------------------------------------
+
+    if item_id > 0:
+        article_url = safe_url(
+            f"{WEBSITE_URL}/?id={item_id}"
+        )
+
+        if article_url:
+            buttons.append([
+                InlineKeyboardButton(
+                    text="📋 COPY / FULL PROMPT",
+                    url=article_url,
+                )
+            ])
+
+    # --------------------------------------------------------
+    # WEBSITE
+    # --------------------------------------------------------
+
+    website_url = safe_url(
+        WEBSITE_URL
     )
 
-    return InlineKeyboardMarkup([
-        [
+    if website_url:
+        buttons.append([
             InlineKeyboardButton(
-                "📋 COPY / FULL PROMPT",
-                url=article_url
+                text="🌐 OPEN PROMPT WEBSITE",
+                url=website_url,
             )
-        ],
-        [
+        ])
+
+    # --------------------------------------------------------
+    # SOURCE
+    # --------------------------------------------------------
+
+    source_url = safe_url(
+        item.get("source_url", "")
+    )
+
+    if source_url:
+        buttons.append([
             InlineKeyboardButton(
-                "🌐 OPEN PROMPT WEBSITE",
-                url=WEBSITE_URL
+                text="📡 SOURCE",
+                url=source_url,
             )
-        ],
-        [
-            InlineKeyboardButton(
-                "📡 SOURCE",
-                url=item["source_url"]
-            )
-        ]
-    ])
+        ])
+
+    if not buttons:
+        return None
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons
+    )
 
 
 async def publish_item(bot, item):
+    """
+    Publish one item.
+    If an image cannot be sent, automatically fall back
+    to a text post so the queue does not get stuck.
+    """
+
+    item = dict(item)
+
+    item_id = item.get("id", "?")
+
+    try:
+        n = ((int(item_id) - 1) % 50) + 1
+    except (TypeError, ValueError):
+        n = 1
 
     caption = design_caption(
         item,
-        ((item["id"] - 1) % 50) + 1
+        n
     )
 
     markup = design_keyboard(
         item
     )
 
+    log.info(
+        "Publishing item #%s | %s",
+        item_id,
+        str(item.get("title", ""))[:100]
+    )
+
+    # --------------------------------------------------------
+    # PHOTO FIRST
+    # --------------------------------------------------------
+
+    image_url = safe_url(
+        item.get("image", "")
+    )
+
+    if image_url:
+        try:
+            kwargs = {
+                "chat_id": TG_CHAT_ID,
+                "photo": image_url,
+                "caption": caption,
+                "parse_mode": "HTML",
+            }
+
+            if markup:
+                kwargs["reply_markup"] = markup
+
+            await bot.send_photo(**kwargs)
+
+            log.info(
+                "Published photo item #%s",
+                item_id
+            )
+
+            return True
+
+        except Exception as exc:
+            log.warning(
+                "Photo failed for item #%s; "
+                "using text fallback: %s",
+                item_id,
+                exc
+            )
+
+    # --------------------------------------------------------
+    # TEXT FALLBACK
+    # --------------------------------------------------------
+
     try:
+        kwargs = {
+            "chat_id": TG_CHAT_ID,
+            "text": caption,
+            "parse_mode": "HTML",
+        }
 
-        if item["image"]:
+        if markup:
+            kwargs["reply_markup"] = markup
 
-            await bot.send_photo(
-                chat_id=TG_CHAT_ID,
-                photo=item["image"],
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=markup
-            )
+        await bot.send_message(**kwargs)
 
-        else:
-
-            await bot.send_message(
-                chat_id=TG_CHAT_ID,
-                text=caption,
-                parse_mode="HTML",
-                reply_markup=markup
-            )
+        log.info(
+            "Published text item #%s",
+            item_id
+        )
 
         return True
 
     except Exception as exc:
-
         log.error(
-            "Telegram publish failed: %s",
+            "Telegram publish failed for item #%s: %s",
+            item_id,
             exc
         )
 
@@ -964,6 +1125,10 @@ async def publish_new_items(
     bot,
     limit=POSTS_PER_CYCLE
 ):
+    """
+    Publish queued records one by one.
+    Failed records remain queued.
+    """
 
     con = db()
 
@@ -975,37 +1140,67 @@ async def publish_new_items(
         ORDER BY score DESC, created_at DESC
         LIMIT ?
         """,
-        (limit,)
+        (limit,),
     ).fetchall()
 
     con.close()
 
+    if not rows:
+        log.info(
+            "No queued prompt items to publish."
+        )
+        return 0
+
     count = 0
 
     for row in rows:
-
         item = dict(row)
 
-        if await publish_item(
-            bot,
-            item
-        ):
-
-            con = db()
-
-            con.execute(
-                """
-                UPDATE prompts
-                SET published=1
-                WHERE id=?
-                """,
-                (item["id"],)
+        try:
+            success = await publish_item(
+                bot,
+                item
             )
 
-            con.commit()
-            con.close()
+            if success:
+                con = db()
 
-            count += 1
+                con.execute(
+                    """
+                    UPDATE prompts
+                    SET published=1
+                    WHERE id=?
+                    """,
+                    (item["id"],),
+                )
+
+                con.commit()
+                con.close()
+
+                count += 1
+
+                log.info(
+                    "Item #%s marked published.",
+                    item["id"]
+                )
+            else:
+                log.warning(
+                    "Item #%s remains queued.",
+                    item["id"]
+                )
+
+        except Exception as exc:
+            log.exception(
+                "Unexpected publish error #%s: %s",
+                item.get("id"),
+                exc
+            )
+
+    log.info(
+        "Publishing finished: %s/%s",
+        count,
+        len(rows)
+    )
 
     return count
 
@@ -1015,7 +1210,6 @@ async def publish_new_items(
 # ============================================================
 
 def is_admin(update: Update):
-
     if not ADMIN_IDS:
         return False
 
@@ -1024,16 +1218,13 @@ def is_admin(update: Update):
     if not user:
         return False
 
-    return str(
-        user.id
-    ) in ADMIN_IDS
+    return str(user.id) in ADMIN_IDS
 
 
 async def alive(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1046,12 +1237,10 @@ async def start_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
     global AUTOMATION_STOPPED
-
     AUTOMATION_STOPPED = False
 
     await update.message.reply_text(
@@ -1073,12 +1262,10 @@ async def stop_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
     global AUTOMATION_STOPPED
-
     AUTOMATION_STOPPED = True
 
     await update.message.reply_text(
@@ -1091,7 +1278,6 @@ async def add_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1125,18 +1311,13 @@ async def add_cmd(
     con = db()
 
     try:
-
         cursor = con.execute(
             """
             INSERT INTO feeds
             (name, url, enabled, created_at)
             VALUES (?, ?, 1, ?)
             """,
-            (
-                name,
-                url,
-                now()
-            )
+            (name, url, now()),
         )
 
         con.commit()
@@ -1148,7 +1329,6 @@ async def add_cmd(
         )
 
     except sqlite3.IntegrityError:
-
         await update.message.reply_text(
             "⚠️ This source already exists."
         )
@@ -1161,7 +1341,6 @@ async def remove_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1179,9 +1358,7 @@ async def remove_cmd(
 
     try:
         feed_id = int(args[1])
-
     except ValueError:
-
         await update.message.reply_text(
             "❌ Invalid ID."
         )
@@ -1195,7 +1372,7 @@ async def remove_cmd(
         SET enabled=0
         WHERE id=?
         """,
-        (feed_id,)
+        (feed_id,),
     )
 
     con.commit()
@@ -1215,7 +1392,6 @@ async def status_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1244,6 +1420,14 @@ async def status_cmd(
         """
     ).fetchone()["c"]
 
+    published = con.execute(
+        """
+        SELECT COUNT(*) c
+        FROM prompts
+        WHERE published=1
+        """
+    ).fetchone()["c"]
+
     con.close()
 
     await update.message.reply_text(
@@ -1251,6 +1435,7 @@ async def status_cmd(
         f"RSS sources: {feeds}\n"
         f"Prompt records: {prompts}\n"
         f"Queued: {queued}\n"
+        f"Published: {published}\n"
         f"Automation: "
         f"{'STOPPED' if AUTOMATION_STOPPED else 'RUNNING'}"
     )
@@ -1260,7 +1445,6 @@ async def sources_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1300,7 +1484,6 @@ async def refresh_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1322,7 +1505,6 @@ async def publish_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1344,7 +1526,6 @@ async def stats_cmd(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if not is_admin(update):
         return
 
@@ -1378,6 +1559,14 @@ async def stats_cmd(
         """
     ).fetchone()["c"]
 
+    queued = con.execute(
+        """
+        SELECT COUNT(*) c
+        FROM prompts
+        WHERE published=0
+        """
+    ).fetchone()["c"]
+
     con.close()
 
     await update.message.reply_text(
@@ -1385,7 +1574,8 @@ async def stats_cmd(
         f"Total: {total}\n"
         f"🖼️ Image: {image}\n"
         f"🎬 Video: {video}\n"
-        f"📢 Published: {published}"
+        f"📢 Published: {published}\n"
+        f"⏳ Queued: {queued}"
     )
 
 
@@ -1395,12 +1585,7 @@ async def stats_cmd(
 
 @app.route("/")
 def home():
-
-    # index.html is currently in the ROOT
-    # of your GitHub repository.
-    root_dir = Path(
-        __file__
-    ).parent
+    root_dir = Path(__file__).parent
 
     return send_from_directory(
         str(root_dir),
@@ -1410,7 +1595,6 @@ def home():
 
 @app.route("/health")
 def health():
-
     return jsonify({
         "status": "ok",
         "service": "ai-trending-prompt"
@@ -1419,7 +1603,6 @@ def health():
 
 @app.route("/api/prompts")
 def api_prompts():
-
     q = request.args.get(
         "q",
         ""
@@ -1437,7 +1620,6 @@ def api_prompts():
                 60
             )
         )
-
     except ValueError:
         limit = 60
 
@@ -1456,27 +1638,18 @@ def api_prompts():
 
     params = []
 
-    if media in (
-        "image",
-        "video"
-    ):
-
-        sql += """
-            AND media_type=?
-        """
-
-        params.append(
-            media
-        )
+    if media in ("image", "video"):
+        sql += " AND media_type=?"
+        params.append(media)
 
     if q:
-
         sql += """
             AND (
                 title LIKE ?
                 OR prompt LIKE ?
                 OR tags LIKE ?
                 OR model LIKE ?
+                OR description LIKE ?
             )
         """
 
@@ -1486,7 +1659,8 @@ def api_prompts():
             like,
             like,
             like,
-            like
+            like,
+            like,
         ])
 
     sql += """
@@ -1515,7 +1689,6 @@ def api_prompts():
 
 @app.route("/api/prompt/<int:item_id>")
 def api_prompt(item_id):
-
     con = db()
 
     row = con.execute(
@@ -1524,13 +1697,12 @@ def api_prompt(item_id):
         FROM prompts
         WHERE id=?
         """,
-        (item_id,)
+        (item_id,),
     ).fetchone()
 
     con.close()
 
     if not row:
-
         return jsonify({
             "error": "not_found"
         }), 404
@@ -1545,7 +1717,6 @@ def api_prompt(item_id):
 # ============================================================
 
 async def automation_loop(bot):
-
     log.info(
         "Automation loop started. "
         "Interval=%s minutes, Posts=%s",
@@ -1554,13 +1725,8 @@ async def automation_loop(bot):
     )
 
     while True:
-
         try:
-
             if not AUTOMATION_STOPPED:
-
-                # RSS collection is synchronous,
-                # so run it outside the event loop.
                 await asyncio.to_thread(
                     collect
                 )
@@ -1569,15 +1735,12 @@ async def automation_loop(bot):
                     bot,
                     limit=POSTS_PER_CYCLE
                 )
-
             else:
-
                 log.info(
                     "Automation currently stopped."
                 )
 
         except Exception as exc:
-
             log.exception(
                 "Automation error: %s",
                 exc
@@ -1589,7 +1752,6 @@ async def automation_loop(bot):
 
 
 def start_web():
-
     log.info(
         "Flask keep-alive started on port %s",
         PORT
@@ -1599,13 +1761,11 @@ def start_web():
         host="0.0.0.0",
         port=PORT,
         debug=False,
-        use_reloader=False
+        use_reloader=False,
     )
 
 
 async def post_init(application):
-
-    # Start background automation.
     asyncio.create_task(
         automation_loop(
             application.bot
@@ -1618,22 +1778,18 @@ async def post_init(application):
 # ============================================================
 
 def main():
-
     init_db()
 
     if not BOT_TOKEN:
-
         raise RuntimeError(
             "TG_BOT_TOKEN is required"
         )
 
     if not TG_CHAT_ID:
-
         raise RuntimeError(
             "TG_CHAT_ID is required"
         )
 
-    # Start Flask server.
     threading.Thread(
         target=start_web,
         daemon=True
@@ -1646,83 +1802,48 @@ def main():
         .build()
     )
 
-    # Telegram commands.
     application.add_handler(
-        CommandHandler(
-            "alive",
-            alive
-        )
+        CommandHandler("alive", alive)
     )
 
     application.add_handler(
-        CommandHandler(
-            "start",
-            start_cmd
-        )
+        CommandHandler("start", start_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "stop",
-            stop_cmd
-        )
+        CommandHandler("stop", stop_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "st",
-            stop_cmd
-        )
+        CommandHandler("st", stop_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "add",
-            add_cmd
-        )
+        CommandHandler("add", add_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "remove",
-            remove_cmd
-        )
+        CommandHandler("remove", remove_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "status",
-            status_cmd
-        )
+        CommandHandler("status", status_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "sources",
-            sources_cmd
-        )
+        CommandHandler("sources", sources_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "refresh",
-            refresh_cmd
-        )
+        CommandHandler("refresh", refresh_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "publish",
-            publish_cmd
-        )
+        CommandHandler("publish", publish_cmd)
     )
 
     application.add_handler(
-        CommandHandler(
-            "stats",
-            stats_cmd
-        )
-
+        CommandHandler("stats", stats_cmd)
     )
 
     log.info(
