@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PromptPulse — Daily AI Image & Video Prompts</title>
+<meta name="description" content="Daily trending AI image and video prompts. Search, copy and create.">
+<style>
+:root{--bg:#09090b;--panel:#111116;--panel2:#17171d;--text:#f7f7f8;--muted:#a5a5ad;--line:#292932;--accent:#8b5cf6;--accent2:#22c55e}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#09090b,#0d0d12);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+a{color:inherit;text-decoration:none}.wrap{max-width:1180px;margin:auto;padding:0 18px}
+header{position:sticky;top:0;z-index:20;background:rgba(9,9,11,.88);backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
+.nav{height:68px;display:flex;align-items:center;justify-content:space-between;gap:14px}.logo{font-weight:900;font-size:21px;letter-spacing:-.5px}.logo span{color:#a78bfa}
+.navlinks{display:flex;gap:8px}.navlinks a,.pill{padding:9px 12px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:13px}
+.hero{padding:64px 0 30px}.hero h1{font-size:clamp(38px,7vw,76px);line-height:.95;letter-spacing:-3px;margin:0 0 18px;max-width:850px}.hero p{max-width:700px;color:var(--muted);font-size:17px;line-height:1.6}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin:28px 0}.search{flex:1;min-width:220px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;color:white;outline:none}.filter{cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:20px 0 60px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:20px;overflow:hidden;transition:.2s}.card:hover{transform:translateY(-3px);border-color:#454553}
+.thumb{height:210px;background:#1a1a21;display:flex;align-items:center;justify-content:center;overflow:hidden}.thumb img{width:100%;height:100%;object-fit:cover}.noimg{font-size:45px}
+.body{padding:17px}.meta{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#a78bfa}.title{font-size:18px;font-weight:800;line-height:1.25;margin:8px 0}.desc{font-size:13px;color:var(--muted);line-height:1.5}.prompt{margin-top:14px;padding:13px;background:#0b0b0f;border:1px solid var(--line);border-radius:13px;color:#ddd;font-size:13px;line-height:1.5;max-height:125px;overflow:hidden}
+.actions{display:flex;gap:8px;margin-top:13px}.btn{border:0;border-radius:11px;padding:10px 12px;cursor:pointer;font-weight:800;font-size:12px}.copy{background:#fff;color:#08080a}.open{background:#25252d;color:#fff}
+footer{border-top:1px solid var(--line);padding:30px 0;color:var(--muted);font-size:13px}
+.detail{max-width:850px;margin:45px auto 80px}.detail h1{font-size:clamp(30px,5vw,55px);line-height:1.05}.detail .bigprompt{white-space:pre-wrap;background:var(--panel);border:1px solid var(--line);padding:22px;border-radius:18px;line-height:1.65}
+.back{display:inline-block;margin-bottom:20px;color:#a78bfa}
+@media(max-width:850px){.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:580px){.grid{grid-template-columns:1fr}.hero{padding-top:40px}.navlinks a:nth-child(n+2){display:none}.thumb{height:230px}}
+</style>
+</head>
+<body>
+<header><div class="wrap nav"><a class="logo" href="./">Prompt<span>Pulse</span></a><div class="navlinks"><a href="./">Trending</a><a href="#latest">Latest</a><a href="https://t.me/" target="_blank">Telegram</a></div></div></header>
+<main class="wrap">
+<section class="hero" id="latest"><h1>Daily AI prompts worth <span style="color:#a78bfa">copying.</span></h1><p>Trending image and video prompt ideas, collected from public RSS sources, filtered and organized into a fast copy-ready library.</p>
+<div class="controls"><input id="search" class="search" placeholder="Search prompts, models, styles..."><button class="pill filter" onclick="setMedia('')">All</button><button class="pill filter" onclick="setMedia('image')">🖼️ Images</button><button class="pill filter" onclick="setMedia('video')">🎬 Videos</button></div></section>
+<div id="grid" class="grid"></div>
+</main>
+<footer><div class="wrap">PromptPulse • AI prompt discovery platform • Always verify source permissions before reusing third-party media.</div></footer>
+<script>
+const API = location.origin;
+let media="";
+function setMedia(x){media=x;load();}
+async function load(){
+ const q=document.getElementById("search").value.trim();
+ const url=API+"/api/prompts?limit=60&media="+encodeURIComponent(media)+"&q="+encodeURIComponent(q);
+ const res=await fetch(url); const data=await res.json();
+ const grid=document.getElementById("grid");
+ if(!data.items.length){grid.innerHTML='<div style="grid-column:1/-1;padding:50px;color:#aaa">No prompts found yet. Start the backend and let the RSS collector run.</div>';return}
+ grid.innerHTML=data.items.map(x=>`
+ <article class="card">
+  <a href="?id=${x.id}">
+   <div class="thumb">${x.image?`<img loading="lazy" src="${esc(x.image)}" alt="">`:`<div class="noimg">${x.media_type==="video"?"🎬":"🖼️"}</div>`}</div>
+  </a>
+  <div class="body">
+   <div class="meta">${x.media_type} · ${esc(x.model||"AI")}</div>
+   <div class="title">${esc(x.title)}</div>
+   <div class="desc">${esc((x.description||"").slice(0,180))}</div>
+   <div class="prompt">${esc(x.prompt||"")}</div>
+   <div class="actions"><button class="btn copy" onclick="copyPrompt(event,${x.id})">📋 Copy Prompt</button><a class="btn open" href="?id=${x.id}">Open</a></div>
+  </div>
+ </article>`).join("");
+}
+async function copyPrompt(e,id){e.stopPropagation();const r=await fetch(API+"/api/prompt/"+id);const x=await r.json();await navigator.clipboard.writeText(x.prompt||"");e.target.textContent="✓ Copied";setTimeout(()=>e.target.textContent="📋 Copy Prompt",1300)}
+function esc(s){return String(s||"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
+document.getElementById("search").addEventListener("input",()=>{clearTimeout(window.t);window.t=setTimeout(load,300)});
+const id=new URLSearchParams(location.search).get("id");
+if(id){
+ fetch(API+"/api/prompt/"+id).then(r=>r.json()).then(x=>{
+  document.querySelector("main").innerHTML=`<section class="detail"><a class="back" href="./">← Back to prompts</a><div class="meta">${esc(x.media_type)} · ${esc(x.model||"AI")}</div><h1>${esc(x.title)}</h1>${x.image?`<img src="${esc(x.image)}" style="width:100%;max-height:560px;object-fit:cover;border-radius:20px;margin:20px 0">`:""}<p style="color:#aaa;line-height:1.6">${esc(x.description||"")}</p><h2>Prompt</h2><div class="bigprompt">${esc(x.prompt||"")}</div><div class="actions"><button class="btn copy" onclick="navigator.clipboard.writeText(${JSON.stringify(x.prompt||"")}).then(()=>this.textContent='✓ Copied')">📋 Copy Prompt</button><a class="btn open" href="${esc(x.source_url||"#")}" target="_blank" rel="noopener">Original Source</a></div>${x.tutorial?`<h2>Tutorial</h2><div class="bigprompt">${esc(x.tutorial)}</div>`:""}</section>`;
+ }).catch(()=>{document.querySelector("main").innerHTML='<section class="detail"><h1>Prompt not found</h1></section>'});
+}else load();
+</script>
+</body>
+</html>
